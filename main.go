@@ -26,6 +26,7 @@ type ProjectMes struct {
 type BuildResult struct {
 	Class  string `json:"_class"`
 	Result string `json:"result"`
+	Id     string `json:"id"`
 }
 
 //一个构建结果
@@ -122,7 +123,7 @@ func Build(brach string, projectName string, version int64, user string) {
 	//等待构建完成，这里是不是可以通过查询当前构建队列获知进度呢，定时不太好
 	time.Sleep(time.Second * 5)
 	//查询构建结果
-	req, err = http.NewRequest("GET", "http://127.0.0.1:8080/job/"+projectName+"/lastBuild/api/json?pretty=true&tree=result", nil)
+	req, err = http.NewRequest("GET", "http://127.0.0.1:8080/job/"+projectName+"/lastBuild/api/json?pretty=true&tree=result,id", nil)
 	if err != nil {
 		log.Printf("构建请求体失败err:%v", err)
 	}
@@ -140,7 +141,8 @@ func Build(brach string, projectName string, version int64, user string) {
 	if err != nil {
 		log.Printf("反序列化构建结果消息失败err:%v", err)
 	}
-	req, err = http.NewRequest("GET", "http://127.0.0.1:8080/job/"+projectName+"/lastBuild/logText/progressiveText", nil)
+	//req, err = http.NewRequest("GET", "http://127.0.0.1:8080/job/"+projectName+"/lastBuild/logText/progressiveText", nil)
+	req, err = http.NewRequest("GET", "http://127.0.0.1:8080/job/222222/lastBuild/buildNumber", nil)
 	if err != nil {
 		log.Printf("构建请求体失败err:%v", err)
 	}
@@ -153,21 +155,27 @@ func Build(brach string, projectName string, version int64, user string) {
 	if err != nil {
 		log.Printf("从body中读取内容错误err:%v", err)
 	}
-	//构建build结果消息
-	buildRecord := BuildRecord{
-		ProjectName: projectName,
-		UserName:    user,
-		Result:      buildResult.Result,
-		NowVersion:  version,
+	//对比最后一次构建的id和最后一次构建成功的id是否一致
+	if string(body) == buildResult.Id {
+		log.Println(string(body), buildResult.Id)
+		//构建build结果消息
+		buildRecord := BuildRecord{
+			ProjectName: projectName,
+			UserName:    user,
+			Result:      buildResult.Result,
+			NowVersion:  version,
+		}
+		//序列化
+		data, err := json.Marshal(buildRecord)
+		//调用server mes接口发送钉钉消息
+		req, err = http.NewRequest("POST", "http://127.0.0.1:8182/mes", strings.NewReader(string(data)))
+		if err != nil {
+			log.Printf("构建请求体失败err:%v", err)
+		}
+		Client.Do(req)
+	} else {
+		log.Println("等待build结束")
 	}
-	//序列化
-	data, err := json.Marshal(buildRecord)
-	//调用server mes接口发送钉钉消息
-	req, err = http.NewRequest("POST", "http://127.0.0.1:8182/mes", strings.NewReader(string(data)))
-	if err != nil {
-		log.Printf("构建请求体失败err:%v", err)
-	}
-	Client.Do(req)
 }
 func main() {
 	//定时轮询redis
