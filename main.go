@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"github.com/garyburd/redigo/redis"
+	"github.com/go-redis/redis/v8"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -42,61 +44,54 @@ var redispw = "123456"
 //http客户端
 var Client = http.Client{}
 var LastBuild = make([]map[string]int64, 0)
-var RedisPool = &redis.Pool{
-	Dial: func() (redis.Conn, error) {
-		//c, err := redis.Dial("tcp", "47.111.20.132:6379")
-		c, err := redis.Dial("tcp", "127.0.0.1:6379")
-		if err != nil {
-			log.Fatalf("初始化redis连接池异常err:", err)
-		}
-		_, err = c.Do("AUTH", redispw)
-		if err != nil {
-			log.Fatalf("redis连接池验证异常err:", err)
-		}
-		return c, err
-	},
-	MaxActive:   100,
-	MaxIdle:     10,
-	IdleTimeout: 240 * time.Second,
-	Wait:        true,
-}
 
 //从redis取出构建需要的信息
 func GetData() {
-	redis := RedisPool.Get()
-	defer redis.Close()
 	spec := make([]map[string]ProjectMes, 0)
-	data, err := redis.Do("get", "GitMes")
-	//log.Println(data)
-	//data1 := data.([]uint8)
-	//做判断主要是防止redis中没有key的情况
-	switch data.(type) {
-	case []uint8:
-		data1 := data.([]uint8)
-		err := json.Unmarshal(data1, &spec)
-		if err != nil {
-			log.Printf("json反序列化错误err: %v", err)
-		}
-		for _, v := range spec {
-			for _, p := range v {
-				log.Println("开始对比版本")
-				if Version >= p.Version {
-					log.Printf("当期项目:%v,版本为%v,历史版本为%v,无需更新", p.ProjectName, p.Version, Version)
-					continue
-				}
-				log.Printf("%v在%v项目(%v)的%v分支进行了push", p.UserName, p.ProjectName, p.Description, p.Branch)
-				go Build(p.Branch, p.ProjectName, p.Version, p.UserName)
-			}
-		}
-	default:
-		log.Println("没有pushevent")
-	}
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "123456", // no password set
+		DB:       0,        // use default DB
+	})
+	var ctx = context.Background()
+	data1, err := rdb.Get(ctx, "GitMes").Result()
 	if err != nil {
-		log.Println("从redis中获取数据错误err:", err)
+		log.Printf("查询redis错误err:%v", err)
+	}
+	err = json.Unmarshal([]byte(data1), &spec)
+	if err != nil {
+		log.Printf("json反序列化错误err: %v", err)
+	}
+	for _, v := range spec {
+		for _, p := range v {
+			log.Println("开始对比版本")
+			//从redis中刚查询客户端执行版本
+			rversion, err := rdb.Get(ctx, "ClientVersion").Result()
+			if err != nil {
+				log.Printf("查询redis错误err:%v", err)
+			}
+			clientversion, err := strconv.ParseInt(rversion, 10, 64)
+			if err != nil {
+				log.Printf("转换失败")
+			}
+			log.Printf("从redis取出版本为%v", clientversion)
+			//如何redis中客户端执行版本高于当前记录版本，则将当前记录版本升级为redis中客户端执行版本
+			if clientversion > Version {
+				Version = clientversion
+			}
+			//对比客户端执行版本和服务端执行版本，如果客户端高则无需执行动作
+			if Version >= p.Version {
+				log.Printf("当期项目:%v,版本为%v,历史版本为%v,无需更新", p.ProjectName, p.Version, Version)
+				continue
+			}
+			log.Printf("%v在%v项目(%v)的%v分支进行了push", p.UserName, p.ProjectName, p.Description, p.Branch)
+			go Build(p.Branch, p.ProjectName, p.Version, p.UserName)
+		}
 	}
 }
 
 //调用jenkins构建
+
 func Build(brach string, projectName string, version int64, user string) {
 	log.Println("开始构建")
 	//拼凑构建请求
@@ -108,6 +103,22 @@ func Build(brach string, projectName string, version int64, user string) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.SetBasicAuth("admin", "admin")
 	Client.Do(req)
+	//执行完毕后更新当前执行version
+	if version > Version {
+		Version = version
+	}
+	//保存当前执行版本到redis
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "123456", // no password set
+		DB:       0,        // use default DB
+	})
+	var ctx = context.Background()
+	err = rdb.Set(ctx, "ClientVersion", Version, 0).Err()
+	//_, err = redis.Do("set", "GitMes", s)
+	if err != nil {
+		log.Println("插入ServerVersion错误err:", err)
+	}
 	//等待构建完成，这里是不是可以通过查询当前构建队列获知进度呢，定时不太好
 	time.Sleep(time.Second * 5)
 	//查询构建结果
@@ -128,9 +139,6 @@ func Build(brach string, projectName string, version int64, user string) {
 	err = json.Unmarshal(body, buildResult)
 	if err != nil {
 		log.Printf("反序列化构建结果消息失败err:%v", err)
-	}
-	if version > Version {
-		Version = version
 	}
 	req, err = http.NewRequest("GET", "http://127.0.0.1:8080/job/"+projectName+"/lastBuild/logText/progressiveText", nil)
 	if err != nil {
