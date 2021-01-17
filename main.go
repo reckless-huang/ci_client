@@ -14,12 +14,12 @@ import (
 
 //一个git事件对象
 type ProjectMes struct {
-	ProjectName string `json:"project_name"`
-	UserName    string `json:"user_name"`
-	Description string `json:"description"`
-	Branch      string `json:"branch"`
-	Version     int64  `json:"version"`
-	Commit      string `json:"commit"`
+	ProjectName string   `json:"project_name"`
+	UserName    string   `json:"user_name"`
+	Description string   `json:"description"`
+	Branch      string   `json:"branch"`
+	Version     int64    `json:"version"`
+	Commit      []string `json:"commit"`
 }
 
 //jenkins查询构建结果返回结构体
@@ -45,16 +45,16 @@ var redispw = "123456"
 //http客户端
 var Client = http.Client{}
 var LastBuild = make([]map[string]int64, 0)
+var ctx = context.Background()
 
 //从redis取出构建需要的信息
 func GetData() {
 	spec := make([]map[string]ProjectMes, 0)
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379",
-		Password: "123456", // no password set
-		DB:       0,        // use default DB
+		Password: redispw, // no password set
+		DB:       0,       // use default DB
 	})
-	var ctx = context.Background()
 	data1, err := rdb.Get(ctx, "GitMes").Result()
 	if err != nil {
 		log.Printf("查询redis错误err:%v", err)
@@ -121,16 +121,49 @@ func Build(brach string, projectName string, version int64, user string) {
 		log.Println("插入ServerVersion错误err:", err)
 	}
 	//等待构建完成，这里是不是可以通过查询当前构建队列获知进度呢，定时不太好
-	time.Sleep(time.Second * 5)
+	//等待一分钟确保任务已分配到queen
+	time.Sleep(time.Minute * 1)
+	resultid, lastbuildid, buildresult := CheckBuild(projectName, version, user)
+	for log.Println("开始获取构建结果"); resultid == lastbuildid; resultid, lastbuildid, buildresult = CheckBuild(projectName, version, user) {
+		//对比最后一次构建的id和最后一次构建成功的id是否一致
+		if resultid != lastbuildid || buildresult == "" {
+			log.Println("等待构建结果返回")
+			time.Sleep(time.Second * 10)
+		} else {
+			log.Println(resultid, lastbuildid)
+			//构建build结果消息
+			buildRecord := &BuildRecord{
+				ProjectName: projectName,
+				UserName:    user,
+				Result:      buildresult,
+				NowVersion:  version,
+			}
+			//序列化
+			data, err := json.Marshal(buildRecord)
+			if err != nil {
+				log.Printf("序列化构建结果错误err:%v", err)
+			}
+			//调用server mes接口发送钉钉消息
+			req, err = http.NewRequest("POST", "http://127.0.0.1:8182/mes", strings.NewReader(string(data)))
+			if err != nil {
+				log.Printf("构建请求体失败err:%v", err)
+			}
+			Client.Do(req)
+			break
+		}
+	}
+}
+
+func CheckBuild(projectName string, version int64, user string) (resultid string, lastbuildid string, buildresult string) {
 	//查询构建结果
-	req, err = http.NewRequest("GET", "http://127.0.0.1:8080/job/"+projectName+"/lastBuild/api/json?pretty=true&tree=result,id", nil)
+	req, err := http.NewRequest("GET", "http://127.0.0.1:8080/job/"+projectName+"/lastBuild/api/json?pretty=true&tree=result,id", nil)
 	if err != nil {
 		log.Printf("构建请求体失败err:%v", err)
 	}
 	req.SetBasicAuth("admin", "admin")
 	res, err := Client.Do(req)
 	if err != nil {
-		log.Printf("查询该项目最后一次构建失败err:%v", err)
+		log.Printf("查询该项目最后一次成功构建失败err:%v", err)
 	}
 	body, err := ioutil.ReadAll(res.Body)
 	if err != nil {
@@ -155,34 +188,47 @@ func Build(brach string, projectName string, version int64, user string) {
 	if err != nil {
 		log.Printf("从body中读取内容错误err:%v", err)
 	}
-	//对比最后一次构建的id和最后一次构建成功的id是否一致
-	if string(body) == buildResult.Id {
-		log.Println(string(body), buildResult.Id)
-		//构建build结果消息
-		buildRecord := BuildRecord{
-			ProjectName: projectName,
-			UserName:    user,
-			Result:      buildResult.Result,
-			NowVersion:  version,
-		}
-		//序列化
-		data, err := json.Marshal(buildRecord)
-		//调用server mes接口发送钉钉消息
-		req, err = http.NewRequest("POST", "http://127.0.0.1:8182/mes", strings.NewReader(string(data)))
-		if err != nil {
-			log.Printf("构建请求体失败err:%v", err)
-		}
-		Client.Do(req)
-	} else {
-		log.Println("等待build结束")
+	return string(body), buildResult.Id, buildResult.Result
+}
+
+//订阅redis获取更新通知
+func Subscribe(RedisClient *redis.Client, c chan string) {
+	//参数1 频道名 字符串类型
+	pubsub := RedisClient.Subscribe(ctx, "Advice")
+	_, err := pubsub.Receive(ctx)
+	if err != nil {
+		return
+	}
+	ch := pubsub.Channel()
+	for msg := range ch {
+		log.Println(msg.Channel, msg.Payload, "\r\n")
+		log.Println("收到更新通知")
+		c <- msg.Payload
+		log.Println(c)
 	}
 }
+
 func main() {
-	//定时轮询redis
-	ticker := time.NewTicker(time.Second * 10)
-	log.Println("开始定时任务60s")
-	for _ = range ticker.C {
-		log.Println("检查是否有pushevent")
+	c := make(chan string)
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: redispw, // no password set
+		DB:       0,       // use default DB
+	})
+	//不用协程就阻塞了
+	go Subscribe(rdb, c)
+	var s int64 = 0
+	//通过chan开始build
+	for j := 0; s < s+1; j++ {
+		<-c
+		log.Printf("第%v次接收server更新请求", j)
 		GetData()
 	}
+	//定时轮询redis
+	//ticker := time.NewTicker(time.Second * 60)
+	//log.Println("开始定时任务60s")
+	//for _ = range ticker.C {
+	//	log.Println("检查是否有pushevent")
+	//	GetData()
+	//}
 }
